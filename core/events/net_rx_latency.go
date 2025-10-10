@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+// https://mp.weixin.qq.com/s/W20R4pAJauZ0MW9r4cQ9pg
 
 package events
 
@@ -39,7 +40,8 @@ import (
 
 type netRecvLatTracing struct{}
 
-// NetTracingData is the full data structure.
+// NetTracingData is the JSON-serializable record stored per latency sample.
+// Latency is in milliseconds (converted from ns in BPF perf event).
 type NetTracingData struct {
 	Comm    string `json:"comm"`
 	Pid     uint64 `json:"pid"`
@@ -56,6 +58,7 @@ type NetTracingData struct {
 }
 
 // from bpf perf
+// Mirrors struct perf_event_t in bpf/netrecvlat.c (field order & sizes must match).
 type netRcvPerfEvent struct {
 	Comm    [bpf.TaskCommLen]byte
 	Latency uint64
@@ -72,6 +75,7 @@ type netRcvPerfEvent struct {
 }
 
 // from include/net/tcp_states.h
+// Indexed by TCP state numeric value coming from kernel skc_state.
 var tcpStateMap = []string{
 	"<nil>", // 0
 	"ESTABLISHED",
@@ -88,8 +92,9 @@ var tcpStateMap = []string{
 	"NEW_SYN_RECV",
 }
 
-const userCopyCase = 2
+const userCopyCase = 2 // index in toWhere slice for TO_USER_COPY stage
 
+// Map numeric stage (enum skb_rcv_where) to string for output.
 var toWhere = []string{
 	"TO_NETIF_RCV",
 	"TO_TCPV4_RCV",
@@ -101,6 +106,7 @@ func init() {
 }
 
 func newNetRcvLat() (*tracing.EventTracingAttr, error) {
+	// Internal controls run interval; FlagTracing marks it as event stream.
 	return &tracing.EventTracingAttr{
 		TracingData: &netRecvLatTracing{},
 		Interval:    10,
@@ -131,6 +137,7 @@ func (c *netRecvLatTracing) Start(ctx context.Context) error {
 		"to_tcpv4":         toTCPV4 * 1000 * 1000,
 		"to_user_copy":     toUserCopy * 1000 * 1000,
 	}
+	// Load/attach BPF object with runtime constants.
 	b, err := bpf.LoadBpf(bpf.ThisBpfOBJ(), args)
 	if err != nil {
 		return err
@@ -165,7 +172,7 @@ func (c *netRecvLatTracing) Start(ctx context.Context) error {
 			}
 			tracerTime := time.Now()
 
-			comm := "<nil>" // not in process context
+			comm := "<nil>" // default when not in process context (early stages)
 			var pid uint64
 			var containerID string
 			if pd.TgidPid != 0 {
@@ -174,6 +181,7 @@ func (c *netRecvLatTracing) Start(ctx context.Context) error {
 
 				// check if its netns same as host netns
 				if pd.Where == userCopyCase {
+					// Perform filtering (host / container level) only when we have process context.
 					cid, skip, err := ignore(pid, comm, hostNetNsInode)
 					if err != nil {
 						return err
@@ -186,7 +194,7 @@ func (c *netRecvLatTracing) Start(ctx context.Context) error {
 			}
 
 			where := toWhere[pd.Where]
-			lat := pd.Latency / 1000 / 1000 // ms
+			lat := pd.Latency / 1000 / 1000 // convert ns->ms
 			state := tcpStateMap[pd.State]
 			saddr, daddr := netutil.Inetv4Ntop(pd.Saddr).String(), netutil.Inetv4Ntop(pd.Daddr).String()
 			sport, dport := netutil.Ntohs(pd.Sport), netutil.Ntohs(pd.Dport)
@@ -196,7 +204,7 @@ func (c *netRecvLatTracing) Start(ctx context.Context) error {
 			title := fmt.Sprintf("comm=%s:%d to=%s lat(ms)=%v state=%s saddr=%s sport=%d daddr=%s dport=%d seq=%d ackSeq=%d pktLen=%d",
 				comm, pid, where, lat, state, saddr, sport, daddr, dport, seq, ackSeq, pktLen)
 
-			// tcp state filter
+			// tcp state filter: only keep established or unknown (<nil>)
 			if (state != "ESTABLISHED") && (state != "<nil>") {
 				continue
 			}
@@ -231,6 +239,7 @@ func (c *netRecvLatTracing) Start(ctx context.Context) error {
 }
 
 func ignore(pid uint64, comm string, hostNetnsInode uint64) (containerID string, skip bool, err error) {
+	// Filter out host processes if configured; also map pid to container ID via netns inode.
 	// check if its netns same as host netns
 	dstInode, err := procfsutil.NetNSInodeByPid(int(pid))
 	if err != nil {
@@ -274,6 +283,7 @@ func estMonoWallOffset() (int64, error) {
 	var offset int64
 
 	for i := 0; i < 10; i++ {
+		// Pair of realtime surrounding one monotonic call to approximate midpoint.
 		err1 := unix.ClockGettime(unix.CLOCK_REALTIME, &t1)
 		err2 := unix.ClockGettime(unix.CLOCK_MONOTONIC, &t2)
 		err3 := unix.ClockGettime(unix.CLOCK_REALTIME, &t3)
@@ -283,6 +293,7 @@ func estMonoWallOffset() (int64, error) {
 
 		delta := unix.TimespecToNsec(t3) - unix.TimespecToNsec(t1)
 		if i == 0 || delta < bestDelta {
+			// Keep best (lowest) t3-t1 window to reduce scheduling noise.
 			bestDelta = delta
 			offset = (unix.TimespecToNsec(t3)+unix.TimespecToNsec(t1))/2 - unix.TimespecToNsec(t2)
 		}
