@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+// https://mp.weixin.qq.com/s/W20R4pAJauZ0MW9r4cQ9pg
 
 package events
 
@@ -38,7 +39,8 @@ import (
 
 type netRecvLatTracing struct{}
 
-// NetTracingData is the full data structure.
+// NetTracingData is the JSON-serializable record stored per latency sample.
+// Latency is in milliseconds (converted from ns in BPF perf event).
 type NetTracingData struct {
 	Comm    string `json:"comm"`
 	Pid     uint64 `json:"pid"`
@@ -55,6 +57,7 @@ type NetTracingData struct {
 }
 
 // from bpf perf
+// Mirrors struct perf_event_t in bpf/netrecvlat.c (field order & sizes must match).
 type netRcvPerfEvent struct {
 	Comm    [bpf.TaskCommLen]byte
 	Latency uint64
@@ -71,6 +74,7 @@ type netRcvPerfEvent struct {
 }
 
 // from include/net/tcp_states.h
+// Indexed by TCP state numeric value coming from kernel skc_state.
 var tcpStateMap = []string{
 	"<nil>", // 0
 	"ESTABLISHED",
@@ -87,8 +91,9 @@ var tcpStateMap = []string{
 	"NEW_SYN_RECV",
 }
 
-const userCopyCase = 2
+const userCopyCase = 2 // index in toWhere slice for TO_USER_COPY stage
 
+// Map numeric stage (enum skb_rcv_where) to string for output.
 var toWhere = []string{
 	"TO_NETIF_RCV",
 	"TO_TCPV4_RCV",
@@ -96,10 +101,12 @@ var toWhere = []string{
 }
 
 func init() {
+	// Register this tracer under name "netrecvlat" for dynamic enable/disable.
 	tracing.RegisterEventTracing("netrecvlat", newNetRcvLat)
 }
 
 func newNetRcvLat() (*tracing.EventTracingAttr, error) {
+	// Internal controls run interval; FlagTracing marks it as event stream.
 	return &tracing.EventTracingAttr{
 		TracingData: &netRecvLatTracing{},
 		Internal:    10,
@@ -108,9 +115,10 @@ func newNetRcvLat() (*tracing.EventTracingAttr, error) {
 }
 
 func (c *netRecvLatTracing) Start(ctx context.Context) error {
-	toNetIf := conf.Get().Tracing.NetRecvLat.ToNetIf       // ms, before RPS to a core recv(__netif_receive_skb)
-	toTCPV4 := conf.Get().Tracing.NetRecvLat.ToTCPV4       // ms, before RPS to TCP recv(tcp_v4_rcv)
-	toUserCopy := conf.Get().Tracing.NetRecvLat.ToUserCopy // ms, before RPS to user recv(skb_copy_datagram_iovec)
+	// Thresholds (ms) configured via config; must all be > 0.
+	toNetIf := conf.Get().Tracing.NetRecvLat.ToNetIf       // before netif_receive_skb tracepoint
+	toTCPV4 := conf.Get().Tracing.NetRecvLat.ToTCPV4       // before tcp_v4_rcv kprobe
+	toUserCopy := conf.Get().Tracing.NetRecvLat.ToUserCopy // before skb_copy_datagram_iovec tracepoint
 
 	if toNetIf == 0 || toTCPV4 == 0 || toUserCopy == 0 {
 		return fmt.Errorf("netrecvlat threshold [%v %v %v]ms invalid", toNetIf, toTCPV4, toUserCopy)
@@ -130,6 +138,7 @@ func (c *netRecvLatTracing) Start(ctx context.Context) error {
 		"to_tcpv4":         toTCPV4 * 1000 * 1000,
 		"to_user_copy":     toUserCopy * 1000 * 1000,
 	}
+	// Load/attach BPF object with runtime constants.
 	b, err := bpf.LoadBpf(bpf.ThisBpfOBJ(), args)
 	if err != nil {
 		return err
@@ -164,15 +173,17 @@ func (c *netRecvLatTracing) Start(ctx context.Context) error {
 			}
 			tracerTime := time.Now()
 
-			comm := "<nil>" // not in process context
+			comm := "<nil>" // default when not in process context (early stages)
 			var pid uint64
 			var containerID string
 			if pd.TgidPid != 0 {
+				// Extract comm/pid only when BPF filled them (user copy stage).
 				comm = strings.TrimRight(string(pd.Comm[:]), "\x00")
 				pid = pd.TgidPid >> 32
 
 				// check if its netns same as host netns
 				if pd.Where == userCopyCase {
+					// Perform filtering (host / container level) only when we have process context.
 					cid, skip, err := ignore(pid, comm, hostNetNsInode)
 					if err != nil {
 						return err
@@ -185,7 +196,7 @@ func (c *netRecvLatTracing) Start(ctx context.Context) error {
 			}
 
 			where := toWhere[pd.Where]
-			lat := pd.Latency / 1000 / 1000 // ms
+			lat := pd.Latency / 1000 / 1000 // convert ns->ms
 			state := tcpStateMap[pd.State]
 			saddr, daddr := netutil.InetNtop(pd.Saddr).String(), netutil.InetNtop(pd.Daddr).String()
 			sport, dport := netutil.InetNtohs(pd.Sport), netutil.InetNtohs(pd.Dport)
@@ -195,7 +206,7 @@ func (c *netRecvLatTracing) Start(ctx context.Context) error {
 			title := fmt.Sprintf("comm=%s:%d to=%s lat(ms)=%v state=%s saddr=%s sport=%d daddr=%s dport=%d seq=%d ackSeq=%d pktLen=%d",
 				comm, pid, where, lat, state, saddr, sport, daddr, dport, seq, ackSeq, pktLen)
 
-			// tcp state filter
+			// tcp state filter: only keep established or unknown (<nil>)
 			if (state != "ESTABLISHED") && (state != "<nil>") {
 				continue
 			}
@@ -230,6 +241,7 @@ func (c *netRecvLatTracing) Start(ctx context.Context) error {
 }
 
 func ignore(pid uint64, comm string, hostNetnsInode uint64) (containerID string, skip bool, err error) {
+	// Filter out host processes if configured; also map pid to container ID via netns inode.
 	// check if its netns same as host netns
 	dstInode, err := procfsutil.NetNSInodeByPid(int(pid))
 	if err != nil {
@@ -251,6 +263,7 @@ func ignore(pid uint64, comm string, hostNetnsInode uint64) (containerID string,
 	}
 	if container != nil {
 		for _, level := range conf.Get().Tracing.NetRecvLat.IgnoreContainerLevel {
+			// Skip containers whose QoS level is in ignore list.
 			if container.Qos.Int() == level {
 				log.Debugf("ignore container %+v", container)
 				skip = true
@@ -273,6 +286,7 @@ func estMonoWallOffset() (int64, error) {
 	var offset int64
 
 	for i := 0; i < 10; i++ {
+		// Pair of realtime surrounding one monotonic call to approximate midpoint.
 		err1 := unix.ClockGettime(unix.CLOCK_REALTIME, &t1)
 		err2 := unix.ClockGettime(unix.CLOCK_MONOTONIC, &t2)
 		err3 := unix.ClockGettime(unix.CLOCK_REALTIME, &t3)
@@ -282,6 +296,7 @@ func estMonoWallOffset() (int64, error) {
 
 		delta := unix.TimespecToNsec(t3) - unix.TimespecToNsec(t1)
 		if i == 0 || delta < bestDelta {
+			// Keep best (lowest) t3-t1 window to reduce scheduling noise.
 			bestDelta = delta
 			offset = (unix.TimespecToNsec(t3)+unix.TimespecToNsec(t1))/2 - unix.TimespecToNsec(t2)
 		}
