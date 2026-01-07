@@ -28,7 +28,7 @@ volatile const long long mono_wall_offset = 0;
 //         ToUserCopy = 115 # ms, from driver to user recv, contains ToNetIf + ToUserCopy
 volatile const long long to_netif	  = 5 * 1000 * 1000;   // 5ms: time from NIC to netif_receive_skb
 volatile const long long to_tcpv4	  = 10 * 1000 * 1000;  // 10ms: time until tcp_v4_rcv
-volatile const long long to_user_copy	  = 115 * 1000 * 1000; // 115ms: time until userspace copy
+volatile const long long to_user_copy	  = 100 * 1000 * 1000; // 100ms: time until userspace copy
 
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
